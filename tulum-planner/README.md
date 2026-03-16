@@ -1,52 +1,40 @@
 # 🌴 Tulum Trip Planner
 
-Plan your Tulum trip with an interactive map, flight lookup, travel time calculations, and day-by-day itinerary.
+Collaborative trip planner with real-time sync via Firebase. Share a link — everyone sees the same trip, live.
 
-## Features
-
-- **Interactive Map** — Leaflet map with numbered stop markers, route lines, Tulum & CUN airport pins
-- **Address Geocoding** — Type any address, auto-resolves to coordinates via Nominatim
-- **Travel Time Calculation** — Auto-calculates travel time between stops via OSRM routing (walk, bike, car, taxi, scooter, colectivo)
-- **Flight Lookup** — Enter airline + flight number, auto-populates route, times, airports (requires Anthropic API key)
-- **Trip Variations** — Create multiple trip versions, duplicate and compare
-- **Drag-to-Reorder** — Reorder stops within a day, map updates to reflect sequence
-- **Persistent Storage** — Data saved to localStorage
-
-## Quick Start
+## Setup
 
 ```bash
 npm install
 npm run dev
 ```
 
-Open [http://localhost:5173](http://localhost:5173)
-
 ## Deploy to Vercel
 
 1. Push to GitHub
 2. Import in [vercel.com](https://vercel.com)
-3. Add environment variable: `ANTHROPIC_API_KEY` = your key
+3. (Optional) Add `ANTHROPIC_API_KEY` env var for flight auto-lookup
 4. Deploy
 
-The flight lookup uses a Vercel serverless function (`/api/flight-lookup.js`) that proxies to the Anthropic API. Without the API key, flight lookup won't work but everything else will.
+## Firebase Setup (already configured)
 
-## Project Structure
+- Firestore database in production mode
+- Rules set to allow all reads/writes (fun app, no auth)
+- Config is in `src/firebase.js`
 
-```
-├── api/
-│   └── flight-lookup.js    # Vercel serverless function for flight API
-├── src/
-│   ├── App.jsx             # Main app component
-│   └── main.jsx            # React entry point
-├── index.html
-├── package.json
-└── vite.config.js
-```
+## How Sharing Works
 
-## Tech Stack
+1. Create a trip on the home page
+2. Copy the URL from your browser (or click "Copy link")
+3. Send to friends — they open it and can edit the same trip
+4. Changes sync in real-time via Firestore `onSnapshot`
 
-- React 18 + Vite
-- Leaflet (map)
-- Nominatim (geocoding)
-- OSRM (routing / travel time)
-- Anthropic Claude API (flight lookup)
+## Features
+
+- 🗺️ Interactive Leaflet map with numbered stops + route lines
+- 📍 Address auto-geocoding (Nominatim)
+- ⏱️ Auto travel time calculation (OSRM routing — walk/bike/car/taxi/scooter/colectivo)
+- ✈️ Flight lookup via Anthropic API + web search
+- 🔀 Drag-to-reorder stops
+- 🏠 Homebase with check-in/out dates + times
+- 🔗 Real-time collaborative editing via Firebase
