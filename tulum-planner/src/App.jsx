@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { db } from "./firebase.js";
 import { doc, setDoc, onSnapshot, deleteDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
+import L from "leaflet";
+import "leaflet/dist/leaflet.css";
 
 /* ════════════════════ CONSTANTS ════════════════════ */
 const TULUM = { lat: 20.2114, lng: -87.4654 };
@@ -76,43 +78,71 @@ function useHash(){
 
 /* ════════════════════ LEAFLET MAP ════════════════════ */
 function LeafletMap({trip,activeDay,onClickLatLng}){
-  const divRef=useRef(null);const mapRef=useRef(null);const lgRef=useRef(null);const[L,setL]=useState(null);
+  const divRef=useRef(null);
+  const mapRef=useRef(null);
+  const lgRef=useRef(null);
+
+  // Init map once
   useEffect(()=>{
-    if(window.L){setL(window.L);return;}
-    const css=document.createElement("link");css.rel="stylesheet";css.href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css";document.head.appendChild(css);
-    const js=document.createElement("script");js.src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js";js.onload=()=>setL(window.L);document.head.appendChild(js);
-  },[]);
-  useEffect(()=>{
-    if(!L||!divRef.current||mapRef.current)return;
+    if(!divRef.current||mapRef.current)return;
     const map=L.map(divRef.current,{zoomControl:false}).setView([TULUM.lat,TULUM.lng],12);
     L.control.zoom({position:"bottomright"}).addTo(map);
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{maxZoom:19}).addTo(map);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{maxZoom:19,attribution:'© CARTO'}).addTo(map);
     map.on("click",e=>onClickLatLng?.({lat:+e.latlng.lat.toFixed(5),lng:+e.latlng.lng.toFixed(5)}));
-    mapRef.current=map;lgRef.current=L.layerGroup().addTo(map);
+    mapRef.current=map;
+    lgRef.current=L.layerGroup().addTo(map);
+    // Force a resize after mount so tiles render fully
+    setTimeout(()=>map.invalidateSize(),200);
     return()=>{map.remove();mapRef.current=null;};
-  },[L]);
-  useEffect(()=>{if(!mapRef.current)return;mapRef.current.off("click");mapRef.current.on("click",e=>onClickLatLng?.({lat:+e.latlng.lat.toFixed(5),lng:+e.latlng.lng.toFixed(5)}));},[onClickLatLng]);
+  },[]);
+
+  // Update click handler ref
   useEffect(()=>{
-    if(!L||!lgRef.current)return;const lg=lgRef.current;lg.clearLayers();const bounds=[];
-    const pin=(lat,lng,html,popup,sz=28)=>{const m=L.marker([lat,lng],{icon:L.divIcon({className:"",html,iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]})}).bindPopup(popup);lg.addLayer(m);bounds.push([lat,lng]);};
+    if(!mapRef.current)return;
+    mapRef.current.off("click");
+    mapRef.current.on("click",e=>onClickLatLng?.({lat:+e.latlng.lat.toFixed(5),lng:+e.latlng.lng.toFixed(5)}));
+  },[onClickLatLng]);
+
+  // Render markers
+  useEffect(()=>{
+    if(!lgRef.current)return;
+    const lg=lgRef.current;
+    lg.clearLayers();
+    const bounds=[];
+
+    const pin=(lat,lng,html,popup,sz=28)=>{
+      const m=L.marker([lat,lng],{icon:L.divIcon({className:"",html,iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]})}).bindPopup(popup);
+      lg.addLayer(m);bounds.push([lat,lng]);
+    };
+
+    // Always show Tulum + CUN
     pin(TULUM.lat,TULUM.lng,`<div style="background:#2a8f82;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;white-space:nowrap;box-shadow:0 1px 4px rgba(0,0,0,.2)">Tulum</div>`,"<b>Tulum Centro</b>",50);
     pin(CUN.lat,CUN.lng,`<div style="font-size:22px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.3))">✈️</div>`,`<b>${CUN.name}</b>`);
+
+    // Flight airports
     [...(trip.arrivalFlights||[]),...(trip.departureFlights||[])].forEach(f=>{
       if(f.depCoords?.lat)pin(f.depCoords.lat,f.depCoords.lng,`<div style="font-size:18px">🛫</div>`,`<b>${f.depAirport||""} ${f.depCity||""}</b>`,24);
       if(f.arrCoords?.lat)pin(f.arrCoords.lat,f.arrCoords.lng,`<div style="font-size:18px">🛬</div>`,`<b>${f.arrAirport||""} ${f.arrCity||""}</b>`,24);
     });
+
+    // Homebase
     if(trip.homebase?.lat)pin(trip.homebase.lat,trip.homebase.lng,`<div style="font-size:22px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.3))">🏠</div>`,`<b>${trip.homebase?.name||"Homebase"}</b><br/>${trip.homebase?.address||""}`);
+
+    // Day stops
     const dis=activeDay!==null?[activeDay]:(trip.days||[]).map((_,i)=>i);
     dis.forEach(di=>{
-      const day=(trip.days||[])[di];if(!day)return;const color=COLORS[di%COLORS.length];const coords=[];
+      const day=(trip.days||[])[di];if(!day)return;
+      const color=COLORS[di%COLORS.length];const coords=[];
       (day.stops||[]).forEach((s,si)=>{
         if(!s.lat)return;coords.push([s.lat,s.lng]);
         pin(s.lat,s.lng,`<div style="width:26px;height:26px;border-radius:50%;background:${color};color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;border:2.5px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.25)">${si+1}</div>`,`<div style="font-family:system-ui;font-size:13px"><b>${si+1}. ${s.name||""}</b><br/>${sI(s.type)} ${TYPES.find(t=>t.v===s.type)?.l||""}${s.transport?`<br/>${tI(s.transport)} ${tL(s.transport)}`:""}${s.travelTime?`<br/>⏱ ${s.travelTime}`:""}</div>`,26);
       });
       if(coords.length>1){lg.addLayer(L.polyline(coords,{color,weight:3,opacity:.5,dashArray:"8 6"}));}
     });
+
     if(bounds.length>1&&mapRef.current)mapRef.current.fitBounds(bounds,{padding:[50,50],maxZoom:14});
-  },[L,trip,activeDay]);
+  },[trip,activeDay]);
+
   return <div ref={divRef} style={{width:"100%",height:"100%",minHeight:400}}/>;
 }
 
@@ -220,14 +250,21 @@ function HomePage(){
     try{const ids=JSON.parse(localStorage.getItem("my-tulum-trips")||"[]");setMyTrips(ids);}catch{setMyTrips([]);}
   },[]);
 
+  const[createErr,setCreateErr]=useState("");
+
   const createTrip=async()=>{
-    setCreating(true);
+    setCreating(true);setCreateErr("");
     try{
+      console.log("[Firebase] Creating trip...");
       const ref=await addDoc(collection(db,"trips"),{...BLANK_TRIP(newName),createdAt:Date.now()});
+      console.log("[Firebase] Trip created:", ref.id);
       const ids=[...myTrips,{id:ref.id,name:newName}];
       localStorage.setItem("my-tulum-trips",JSON.stringify(ids));
       window.location.hash=`#/trip/${ref.id}`;
-    }catch(e){console.error(e);alert("Failed to create trip");}
+    }catch(e){
+      console.error("[Firebase] Create error:",e);
+      setCreateErr(`Failed: ${e.message}. Make sure Firestore rules allow writes (see README).`);
+    }
     setCreating(false);
   };
 
@@ -250,6 +287,7 @@ function HomePage(){
           <input style={{...S.inp,fontSize:15,padding:"12px 16px"}} placeholder="Trip name" value={newName} onChange={e=>setNewName(e.target.value)} onKeyDown={e=>e.key==="Enter"&&createTrip()}/>
           <button style={{...S.btnFill,fontSize:15,padding:"12px 24px"}} onClick={createTrip} disabled={creating}>{creating?"Creating…":"Create Trip"}</button>
         </div>
+        {createErr&&<div style={{...S.errBox,marginBottom:16}}>{createErr}</div>}
         {myTrips.length>0&&<div style={S.homeLabel}>Your Trips</div>}
         {myTrips.map(t=>(
           <a key={t.id} href={`#/trip/${t.id}`} style={S.homeTripCard}>
@@ -274,6 +312,7 @@ function HomePage(){
 function TripPage({tripId}){
   const[trip,setTrip]=useState(null);
   const[loading,setLoading]=useState(true);
+  const[syncErr,setSyncErr]=useState("");
   const[view,setView]=useState("plan");
   const[activeDay,setActiveDay]=useState(null);
   const[addFlight,setAddFlight]=useState(null);
@@ -290,23 +329,33 @@ function TripPage({tripId}){
 
   // Real-time listener
   useEffect(()=>{
-    const unsub=onSnapshot(doc(db,"trips",tripId),snap=>{
-      if(snap.exists()){
-        if(skipSync.current){skipSync.current=false;return;}
-        setTrip(snap.data());
-        // save to local list
-        try{
-          const ids=JSON.parse(localStorage.getItem("my-tulum-trips")||"[]");
-          if(!ids.find(t=>t.id===tripId)){
-            ids.push({id:tripId,name:snap.data().name||"Trip"});
-            localStorage.setItem("my-tulum-trips",JSON.stringify(ids));
-          }
-        }catch{}
-      } else {
-        setTrip(null);
+    console.log("[Firebase] Subscribing to trip:", tripId);
+    const unsub=onSnapshot(
+      doc(db,"trips",tripId),
+      snap=>{
+        console.log("[Firebase] Snapshot received, exists:", snap.exists());
+        if(snap.exists()){
+          if(skipSync.current){skipSync.current=false;return;}
+          setTrip(snap.data());
+          setSyncErr("");
+          try{
+            const ids=JSON.parse(localStorage.getItem("my-tulum-trips")||"[]");
+            if(!ids.find(t=>t.id===tripId)){
+              ids.push({id:tripId,name:snap.data().name||"Trip"});
+              localStorage.setItem("my-tulum-trips",JSON.stringify(ids));
+            }
+          }catch{}
+        } else {
+          setTrip(null);
+        }
+        setLoading(false);
+      },
+      err=>{
+        console.error("[Firebase] Listen error:", err);
+        setSyncErr(`Firebase error: ${err.message}. Check Firestore rules — they must allow read/write.`);
+        setLoading(false);
       }
-      setLoading(false);
-    });
+    );
     return unsub;
   },[tripId]);
 
@@ -314,7 +363,15 @@ function TripPage({tripId}){
   const save=useCallback(async(newTrip)=>{
     setTrip(newTrip);
     skipSync.current=true;
-    try{await setDoc(doc(db,"trips",tripId),newTrip);}catch(e){console.error("Save error:",e);}
+    try{
+      await setDoc(doc(db,"trips",tripId),newTrip);
+      console.log("[Firebase] Saved successfully");
+      setSyncErr("");
+    }catch(e){
+      console.error("[Firebase] Save error:",e);
+      setSyncErr(`Save failed: ${e.message}. Check Firestore rules.`);
+      skipSync.current=false;
+    }
   },[tripId]);
 
   const up=fn=>{
@@ -360,12 +417,13 @@ function TripPage({tripId}){
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <button style={{...S.btnFlat,fontSize:11,padding:"5px 12px"}} onClick={copyLink}>{copied?"✓ Copied!":"📋 Copy link"}</button>
-          <div style={S.liveBadge}>● Live</div>
+          <div style={syncErr?S.errBadge:S.liveBadge}>{syncErr?"● Error":"● Live"}</div>
           <div style={S.tabRow}>
             {["plan","map"].map(v=>(<button key={v} onClick={()=>setView(v)} style={{...S.tab,...(view===v?S.tabActive:{})}}>{v==="plan"?"Itinerary":"Map"}</button>))}
           </div>
         </div>
       </header>
+      {syncErr&&<div style={S.syncErrBar}>{syncErr}</div>}
       <div style={S.body}>
         {/* SIDEBAR */}
         <aside style={S.side}>
@@ -454,6 +512,8 @@ const S={
   topTitle:{fontSize:16,fontWeight:700,letterSpacing:"-.3px"},
   topSub:{fontSize:11,color:"#aaa",marginLeft:2},
   liveBadge:{fontSize:10,color:"#3a9e5c",fontWeight:600,background:"#edfbf0",padding:"3px 8px",borderRadius:10},
+  errBadge:{fontSize:10,color:"#c45d3e",fontWeight:600,background:"#fef0ec",padding:"3px 8px",borderRadius:10},
+  syncErrBar:{background:"#fef0ec",color:"#c45d3e",padding:"8px 20px",fontSize:12,fontWeight:500,borderBottom:"1px solid #f5d5cc"},
   tabRow:{display:"flex",gap:2,background:"#f2f1ed",borderRadius:8,padding:3},
   tab:{padding:"5px 16px",border:"none",borderRadius:6,background:"transparent",fontSize:12,fontWeight:600,cursor:"pointer",color:"#888",fontFamily:"inherit"},
   tabActive:{background:"#fff",color:"#1a1a1a",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
