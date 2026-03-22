@@ -1,8 +1,9 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import { db } from "./firebase.js";
-import { doc, setDoc, onSnapshot, deleteDoc, collection, addDoc, serverTimestamp } from "firebase/firestore";
-import L from "leaflet";
-import "leaflet/dist/leaflet.css";
+import { doc, setDoc, onSnapshot, deleteDoc, collection, addDoc, serverTimestamp, query, orderBy } from "firebase/firestore";
+import { jsPDF } from "jspdf";
+
+const GMAPS_KEY = "AIzaSyDs3SBHq2KvtCg2e3afj0C3bWKqzJXWTYI";
 
 /* ════════════════════ CONSTANTS ════════════════════ */
 const TULUM = { lat: 20.2114, lng: -87.4654 };
@@ -31,25 +32,78 @@ const fmtD=d=>d?new Date(d+"T12:00:00").toLocaleDateString("en-US",{weekday:"sho
 
 const BLANK_TRIP=name=>({name:name||"Tulum Trip",arrivalFlights:[],departureFlights:[],homebase:null,days:[],createdAt:Date.now()});
 
-/* ════════════════════ GEOCODE ════════════════════ */
+/* ════════════════════ GEOCODE (Google) ════════════════════ */
 const geocode=async addr=>{
-  try{const r=await fetch(`https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(addr)}&format=json&limit=1`);const d=await r.json();if(d.length)return{lat:+parseFloat(d[0].lat).toFixed(5),lng:+parseFloat(d[0].lon).toFixed(5)};}catch{}return null;
+  if(!addr||addr.trim().length<3)return null;
+  console.log("[Geocode] Looking up:", addr);
+  try{
+    const r=await fetch(`https://maps.googleapis.com/maps/api/geocode/json?address=${encodeURIComponent(addr)}&key=${GMAPS_KEY}`);
+    const d=await r.json();
+    console.log("[Geocode] Status:", d.status, "Results:", d.results?.length);
+    if(d.status==="OK"&&d.results?.length){
+      const loc=d.results[0].geometry.location;
+      const result={lat:+loc.lat.toFixed(5),lng:+loc.lng.toFixed(5)};
+      console.log("[Geocode] Found:", result, "→", d.results[0].formatted_address);
+      return result;
+    }
+    console.log("[Geocode] No results for:", addr);
+  }catch(e){console.error("[Geocode] Error:",e);}
+  return null;
 };
 
-/* ════════════════════ OSRM TRAVEL TIME ════════════════════ */
+/* ════════════════════ TRAVEL TIME (Google Directions via serverless) ════════════════════ */
+const googleTravelMode=(transport)=>{
+  if(transport==="walk")return"walking";
+  if(transport==="bike")return"bicycling";
+  return"driving";
+};
+
 const calcTravel=async(from,to,transport)=>{
   if(!from?.lat||!to?.lat)return null;
-  const pr=tP(transport)==="car"?"driving":tP(transport)==="bike"?"cycling":"walking";
+  const mode=googleTravelMode(transport);
+  
+  // Use serverless endpoint (avoids CORS, uses server-side Google API)
   try{
-    const r=await fetch(`https://router.project-osrm.org/route/v1/${pr}/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`);
+    const r=await fetch("/api/directions",{
+      method:"POST",
+      headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({fromLat:from.lat,fromLng:from.lng,toLat:to.lat,toLng:to.lng,mode}),
+    });
+    if(r.ok){
+      const d=await r.json();
+      let secs=d.duration;
+      const meters=d.distance;
+      // Adjust for scooter/colectivo
+      if(transport==="scooter")secs=Math.round(secs*1.3);
+      if(transport==="colectivo")secs=Math.round(secs*1.5);
+      const mins=Math.round(secs/60);
+      const km=(meters/1000).toFixed(1);
+      const timeStr=mins<60?`${mins} min`:`${Math.floor(mins/60)}h ${mins%60}m`;
+      console.log("[Travel] Google:",mode,timeStr,km+"km");
+      return`${timeStr} (${km} km)`;
+    }
+    console.log("[Travel] Serverless failed, status:", r.status);
+  }catch(e){
+    console.log("[Travel] Serverless error:", e.message);
+  }
+
+  // Fallback: OSRM (for local dev without serverless)
+  console.log("[Travel] Falling back to OSRM");
+  const pr=transport==="walk"?"foot":transport==="bike"?"bike":"car";
+  const osrmMode=pr==="car"?"driving":pr==="bike"?"cycling":"walking";
+  try{
+    const r=await fetch(`https://router.project-osrm.org/route/v1/${osrmMode}/${from.lng},${from.lat};${to.lng},${to.lat}?overview=false`);
     const d=await r.json();
     if(d.routes?.length){
-      let s=d.routes[0].duration,m=d.routes[0].distance;
-      if(transport==="scooter")s*=1.3;if(transport==="colectivo")s*=1.5;
-      const mins=Math.round(s/60);const km=(m/1000).toFixed(1);
-      return mins<60?`${mins} min (${km} km)`:`${Math.floor(mins/60)}h ${mins%60}m (${km} km)`;
+      let secs=d.routes[0].duration;let meters=d.routes[0].distance;
+      if(transport==="scooter")secs*=1.3;if(transport==="colectivo")secs*=1.5;
+      const mins=Math.round(secs/60);const km=(meters/1000).toFixed(1);
+      const timeStr=mins<60?`${mins} min`:`${Math.floor(mins/60)}h ${mins%60}m`;
+      console.log("[Travel] OSRM:",osrmMode,timeStr,km+"km");
+      return`${timeStr} (${km} km)`;
     }
-  }catch{}return null;
+  }catch{}
+  return null;
 };
 
 /* ════════════════════ FLIGHT LOOKUP ════════════════════ */
@@ -76,72 +130,192 @@ function useHash(){
   return hash;
 }
 
-/* ════════════════════ LEAFLET MAP ════════════════════ */
-function LeafletMap({trip,activeDay,onClickLatLng}){
+/* ════════════════════ GOOGLE MAP ════════════════════ */
+function GMap({trip,activeDay,onClickLatLng,visible,showLines,pinMode}){
   const divRef=useRef(null);
   const mapRef=useRef(null);
-  const lgRef=useRef(null);
+  const overlaysRef=useRef([]);
+  const[loaded,setLoaded]=useState(!!window.google?.maps);
 
-  // Init map once
+  // Load Google Maps API
   useEffect(()=>{
-    if(!divRef.current||mapRef.current)return;
-    const map=L.map(divRef.current,{zoomControl:false}).setView([TULUM.lat,TULUM.lng],12);
-    L.control.zoom({position:"bottomright"}).addTo(map);
-    L.tileLayer("https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png",{maxZoom:19,attribution:'© CARTO'}).addTo(map);
-    map.on("click",e=>onClickLatLng?.({lat:+e.latlng.lat.toFixed(5),lng:+e.latlng.lng.toFixed(5)}));
-    mapRef.current=map;
-    lgRef.current=L.layerGroup().addTo(map);
-    // Force a resize after mount so tiles render fully
-    setTimeout(()=>map.invalidateSize(),200);
-    return()=>{map.remove();mapRef.current=null;};
+    if(window.google?.maps){setLoaded(true);return;}
+    if(document.getElementById("gmaps-script"))return;
+    const s=document.createElement("script");
+    s.id="gmaps-script";
+    s.src=`https://maps.googleapis.com/maps/api/js?key=${GMAPS_KEY}&libraries=marker`;
+    s.async=true;s.defer=true;
+    s.onload=()=>setLoaded(true);
+    document.head.appendChild(s);
   },[]);
 
-  // Update click handler ref
+  // Init map
+  useEffect(()=>{
+    if(!loaded||!divRef.current||mapRef.current)return;
+    const map=new google.maps.Map(divRef.current,{
+      center:{lat:TULUM.lat,lng:TULUM.lng},zoom:13,
+      mapTypeControl:true,
+      mapTypeControlOptions:{
+        style:google.maps.MapTypeControlStyle.HORIZONTAL_BAR,
+        position:google.maps.ControlPosition.TOP_RIGHT,
+        mapTypeIds:["roadmap","satellite","hybrid"],
+      },
+      streetViewControl:true,
+      fullscreenControl:true,
+      zoomControl:true,
+    });
+    map.addListener("click",e=>{
+      if(e.latLng)onClickLatLng?.({lat:+e.latLng.lat().toFixed(5),lng:+e.latLng.lng().toFixed(5)});
+    });
+    mapRef.current=map;
+    return()=>{mapRef.current=null;};
+  },[loaded]);
+
+  // Update click handler
   useEffect(()=>{
     if(!mapRef.current)return;
-    mapRef.current.off("click");
-    mapRef.current.on("click",e=>onClickLatLng?.({lat:+e.latlng.lat.toFixed(5),lng:+e.latlng.lng.toFixed(5)}));
+    google.maps.event.clearListeners(mapRef.current,"click");
+    mapRef.current.addListener("click",e=>{
+      if(e.latLng)onClickLatLng?.({lat:+e.latLng.lat().toFixed(5),lng:+e.latLng.lng().toFixed(5)});
+    });
   },[onClickLatLng]);
 
-  // Render markers
+  // Cursor for pin mode
   useEffect(()=>{
-    if(!lgRef.current)return;
-    const lg=lgRef.current;
-    lg.clearLayers();
-    const bounds=[];
+    if(!mapRef.current)return;
+    mapRef.current.setOptions({draggableCursor:pinMode?"crosshair":null});
+  },[pinMode]);
 
-    const pin=(lat,lng,html,popup,sz=28)=>{
-      const m=L.marker([lat,lng],{icon:L.divIcon({className:"",html,iconSize:[sz,sz],iconAnchor:[sz/2,sz/2]})}).bindPopup(popup);
-      lg.addLayer(m);bounds.push([lat,lng]);
+  // Resolve fromId to coords
+  const resolveFrom=(fromId)=>{
+    if(!fromId)return null;
+    if(fromId==="homebase"&&trip.homebase?.lat)return{lat:trip.homebase.lat,lng:trip.homebase.lng};
+    if(fromId==="airport")return{lat:CUN.lat,lng:CUN.lng};
+    for(const day of(trip.days||[]))for(const s of(day.stops||[]))if(s.id===fromId&&s.lat)return{lat:s.lat,lng:s.lng};
+    return null;
+  };
+
+  // Create an HTML marker
+  const htmlMarker=(map,lat,lng,html,title)=>{
+    const div=document.createElement("div");
+    div.innerHTML=html;div.style.cursor="pointer";
+    const ov=new google.maps.OverlayView();
+    ov.onAdd=function(){this.getPanes().floatPane.appendChild(div);};
+    ov.draw=function(){const p=this.getProjection().fromLatLngToDivPixel(new google.maps.LatLng(lat,lng));if(p){div.style.position="absolute";div.style.left=(p.x-14)+"px";div.style.top=(p.y-14)+"px";}};
+    ov.onRemove=function(){div.remove();};
+    ov.setMap(map);
+    if(title){div.addEventListener("click",()=>{const iw=new google.maps.InfoWindow({content:title,position:{lat,lng}});iw.open(map);});}
+    return ov;
+  };
+
+  // Render all markers and lines
+  useEffect(()=>{
+    if(!loaded||!mapRef.current)return;
+    const map=mapRef.current;
+    // Clear previous
+    overlaysRef.current.forEach(o=>{if(o.setMap)o.setMap(null);});
+    overlaysRef.current=[];
+
+    const bounds=new google.maps.LatLngBounds();
+    const dayBounds=new google.maps.LatLngBounds(); // only day-relevant pins
+    let hasDayPins=false;
+
+    const addMarker=(lat,lng,html,title,addToBounds=true)=>{
+      const ov=htmlMarker(map,lat,lng,html,title);
+      overlaysRef.current.push(ov);
+      if(addToBounds){bounds.extend({lat,lng});}
     };
 
-    // Always show Tulum + CUN
-    pin(TULUM.lat,TULUM.lng,`<div style="background:#2a8f82;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;white-space:nowrap;box-shadow:0 1px 4px rgba(0,0,0,.2)">Tulum</div>`,"<b>Tulum Centro</b>",50);
-    pin(CUN.lat,CUN.lng,`<div style="font-size:22px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.3))">✈️</div>`,`<b>${CUN.name}</b>`);
+    const addDayMarker=(lat,lng,html,title)=>{
+      addMarker(lat,lng,html,title,true);
+      dayBounds.extend({lat,lng});hasDayPins=true;
+    };
 
-    // Flight airports
+    // Tulum label — always show but don't force bounds
+    addMarker(TULUM.lat,TULUM.lng,
+      `<div style="background:#2a8f82;color:#fff;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:700;white-space:nowrap;box-shadow:0 2px 6px rgba(0,0,0,.25)">Tulum</div>`,
+      "<b>Tulum Centro</b>",false);
+
+    // CUN — only add to bounds if viewing "All" (no specific day)
+    addMarker(CUN.lat,CUN.lng,
+      `<div style="font-size:22px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.3))">✈️</div>`,
+      `<b>${CUN.name}</b>`,activeDay===null);
+
+    // Flights — only add to bounds on "All"
     [...(trip.arrivalFlights||[]),...(trip.departureFlights||[])].forEach(f=>{
-      if(f.depCoords?.lat)pin(f.depCoords.lat,f.depCoords.lng,`<div style="font-size:18px">🛫</div>`,`<b>${f.depAirport||""} ${f.depCity||""}</b>`,24);
-      if(f.arrCoords?.lat)pin(f.arrCoords.lat,f.arrCoords.lng,`<div style="font-size:18px">🛬</div>`,`<b>${f.arrAirport||""} ${f.arrCity||""}</b>`,24);
+      if(f.depCoords?.lat)addMarker(f.depCoords.lat,f.depCoords.lng,`<div style="font-size:18px">🛫</div>`,`<b>${f.depAirport||""} ${f.depCity||""}</b>`,activeDay===null);
+      if(f.arrCoords?.lat)addMarker(f.arrCoords.lat,f.arrCoords.lng,`<div style="font-size:18px">🛬</div>`,`<b>${f.arrAirport||""} ${f.arrCity||""}</b>`,activeDay===null);
     });
 
-    // Homebase
-    if(trip.homebase?.lat)pin(trip.homebase.lat,trip.homebase.lng,`<div style="font-size:22px;filter:drop-shadow(0 1px 2px rgba(0,0,0,.3))">🏠</div>`,`<b>${trip.homebase?.name||"Homebase"}</b><br/>${trip.homebase?.address||""}`);
+    // Homebase — always show, add to day bounds if day is selected
+    if(trip.homebase?.lat){
+      addMarker(trip.homebase.lat,trip.homebase.lng,
+        `<div style="font-size:22px;filter:drop-shadow(0 2px 4px rgba(0,0,0,.3))">🏠</div>`,
+        `<b>${trip.homebase?.name||"Homebase"}</b>`);
+      if(activeDay!==null){dayBounds.extend({lat:trip.homebase.lat,lng:trip.homebase.lng});hasDayPins=true;}
+    }
 
     // Day stops
     const dis=activeDay!==null?[activeDay]:(trip.days||[]).map((_,i)=>i);
     dis.forEach(di=>{
       const day=(trip.days||[])[di];if(!day)return;
-      const color=COLORS[di%COLORS.length];const coords=[];
+      const color=COLORS[di%COLORS.length];
+      const stopsWithCoords=[];
+
       (day.stops||[]).forEach((s,si)=>{
-        if(!s.lat)return;coords.push([s.lat,s.lng]);
-        pin(s.lat,s.lng,`<div style="width:26px;height:26px;border-radius:50%;background:${color};color:#fff;display:flex;align-items:center;justify-content:center;font-size:11px;font-weight:700;border:2.5px solid #fff;box-shadow:0 1px 4px rgba(0,0,0,.25)">${si+1}</div>`,`<div style="font-family:system-ui;font-size:13px"><b>${si+1}. ${s.name||""}</b><br/>${sI(s.type)} ${TYPES.find(t=>t.v===s.type)?.l||""}${s.transport?`<br/>${tI(s.transport)} ${tL(s.transport)}`:""}${s.travelTime?`<br/>⏱ ${s.travelTime}`:""}</div>`,26);
+        if(!s.lat)return;
+        stopsWithCoords.push({...s,si});
+        addDayMarker(s.lat,s.lng,
+          `<div style="width:28px;height:28px;border-radius:50%;background:${color};color:#fff;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;border:3px solid #fff;box-shadow:0 2px 6px rgba(0,0,0,.3)">${si+1}</div>`,
+          `<div style="font-family:system-ui;font-size:13px;max-width:200px"><b>${si+1}. ${s.name||""}</b><br/>${sI(s.type)} ${TYPES.find(t=>t.v===s.type)?.l||""}${s.transport?`<br/>${tI(s.transport)} ${tL(s.transport)}`:""}${s.travelTime?`<br/>⏱ ${s.travelTime}`:""}</div>`);
       });
-      if(coords.length>1){lg.addLayer(L.polyline(coords,{color,weight:3,opacity:.5,dashArray:"8 6"}));}
+
+      // Draw lines in strict sequential order: homebase → stop1 → stop2 → stop3
+      if(showLines&&stopsWithCoords.length>0){
+        // First line: homebase → first stop
+        if(trip.homebase?.lat){
+          const first=stopsWithCoords[0];
+          const line=new google.maps.Polyline({
+            path:[{lat:trip.homebase.lat,lng:trip.homebase.lng},{lat:first.lat,lng:first.lng}],
+            strokeColor:color,strokeWeight:2.5,strokeOpacity:0.5,
+            icons:[{icon:{path:google.maps.SymbolPath.FORWARD_CLOSED_ARROW,scale:3,fillColor:color,fillOpacity:.8,strokeWeight:1,strokeColor:"#fff"},offset:"100%"}],
+            map,
+          });
+          overlaysRef.current.push(line);
+        }
+        // Subsequent lines: stop N → stop N+1
+        for(let i=0;i<stopsWithCoords.length-1;i++){
+          const from=stopsWithCoords[i],to=stopsWithCoords[i+1];
+          const line=new google.maps.Polyline({
+            path:[{lat:from.lat,lng:from.lng},{lat:to.lat,lng:to.lng}],
+            strokeColor:color,strokeWeight:2.5,strokeOpacity:0.6,
+            icons:[{icon:{path:google.maps.SymbolPath.FORWARD_CLOSED_ARROW,scale:3,fillColor:color,fillOpacity:.8,strokeWeight:1,strokeColor:"#fff"},offset:"100%"}],
+            map,
+          });
+          overlaysRef.current.push(line);
+        }
+      }
     });
 
-    if(bounds.length>1&&mapRef.current)mapRef.current.fitBounds(bounds,{padding:[50,50],maxZoom:14});
-  },[trip,activeDay]);
+    // Fit bounds — prefer day-specific bounds when a day is selected
+    if(activeDay!==null&&hasDayPins){
+      map.fitBounds(dayBounds,{top:50,bottom:50,left:50,right:50});
+    }else if(!bounds.isEmpty()){
+      // For "All" view, if we have day pins, prefer those; else use all
+      if(hasDayPins)map.fitBounds(dayBounds,{top:50,bottom:50,left:50,right:50});
+      else map.setCenter({lat:TULUM.lat,lng:TULUM.lng});
+    }
+  },[loaded,trip,activeDay,showLines]);
+
+  if(!GMAPS_KEY)return(
+    <div style={{width:"100%",height:"100%",display:"flex",alignItems:"center",justifyContent:"center",background:"#f5f3ee",flexDirection:"column",gap:8,padding:20}}>
+      <div style={{fontSize:28}}>🗺</div>
+      <div style={{fontWeight:600,fontSize:14}}>Google Maps API key needed</div>
+      <div style={{fontSize:12,color:"#888",textAlign:"center",maxWidth:300}}>
+        Add <code>VITE_GOOGLE_MAPS_KEY=your_key</code> to a <code>.env.local</code> file and restart the dev server. For Vercel, add it as an environment variable.
+      </div>
+    </div>
+  );
 
   return <div ref={divRef} style={{width:"100%",height:"100%",minHeight:400}}/>;
 }
@@ -149,8 +323,22 @@ function LeafletMap({trip,activeDay,onClickLatLng}){
 /* ════════════════════ SMALL COMPONENTS ════════════════════ */
 function AddrInput({value,onChange,onGeocode,placeholder}){
   const[busy,setBusy]=useState(false);
-  const go=async()=>{if(!value)return;setBusy(true);const r=await geocode(value);setBusy(false);if(r)onGeocode(r);};
-  return(<div style={{display:"flex",gap:6}}><input style={{...S.inp,flex:1}} placeholder={placeholder||"Address"} value={value} onChange={e=>onChange(e.target.value)} onBlur={go} onKeyDown={e=>e.key==="Enter"&&go()}/><button style={{...S.btnFlat,padding:"6px 10px",opacity:busy?.5:1}} onClick={go} disabled={busy}>{busy?"…":"📍"}</button></div>);
+  const[status,setStatus]=useState(""); // "ok" | "fail" | ""
+  const go=async()=>{
+    if(!value||value.trim().length<3)return;
+    setBusy(true);setStatus("");
+    const r=await geocode(value);
+    setBusy(false);
+    if(r){onGeocode(r);setStatus("ok");}
+    else setStatus("fail");
+  };
+  return(<div style={{display:"flex",flexDirection:"column",gap:4}}>
+    <div style={{display:"flex",gap:6}}>
+      <input style={{...S.inp,flex:1}} placeholder={placeholder||"Address"} value={value} onChange={e=>{onChange(e.target.value);setStatus("");}} onBlur={go} onKeyDown={e=>e.key==="Enter"&&go()}/>
+      <button style={{...S.btnFlat,padding:"6px 10px",opacity:busy?.5:1}} onClick={go} disabled={busy}>{busy?"…":"📍"}</button>
+    </div>
+    {status==="fail"&&<div style={{fontSize:11,color:"#c45d3e"}}>⚠ Couldn't find this address — try adding "Tulum, Mexico" at the end</div>}
+  </div>);
 }
 
 function FlightForm({initial,onSave,onCancel}){
@@ -173,44 +361,123 @@ function FlightForm({initial,onSave,onCancel}){
   </div>);
 }
 
-function HomebaseForm({initial,onSave,onCancel,coordHint}){
+function HomebaseForm({initial,onSave,onCancel,coordHint,onRequestPin}){
   const[h,setH]=useState(initial||{name:"",address:"",checkInDate:"",checkInTime:"",checkOutDate:"",checkOutTime:"",notes:"",lat:null,lng:null});
+  const[saving,setSaving]=useState(false);
   const s=(k,v)=>setH(p=>({...p,[k]:v}));
   useEffect(()=>{if(coordHint?.lat)setH(p=>({...p,lat:coordHint.lat,lng:coordHint.lng}));},[coordHint]);
+
+  const handleSave=async()=>{
+    let final={...h};
+    if(final.address&&!final.lat){
+      setSaving(true);
+      console.log("[HomebaseForm] Geocoding before save:", final.address);
+      const geo=await geocode(final.address);
+      if(geo){final.lat=geo.lat;final.lng=geo.lng;}
+      setSaving(false);
+    }
+    console.log("[HomebaseForm] Saving:", final.name, "lat:", final.lat, "lng:", final.lng);
+    onSave(final);
+  };
+
   return(<div style={S.formCard}>
     <input style={S.inp} placeholder="Name (Airbnb, Hotel…)" value={h.name} onChange={e=>s("name",e.target.value)}/>
-    <AddrInput value={h.address} onChange={v=>s("address",v)} onGeocode={c=>setH(p=>({...p,lat:c.lat,lng:c.lng}))} placeholder="Full address (auto-geocodes)"/>
-    {h.lat&&<div style={S.coordBadge}>📍 {h.lat}, {h.lng}</div>}
+    <AddrInput value={h.address} onChange={v=>s("address",v)} onGeocode={c=>{console.log("[HomebaseForm] Geocoded:",c);setH(p=>({...p,lat:c.lat,lng:c.lng}));}} placeholder="Full address (auto-geocodes)"/>
+    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+      {h.lat&&<div style={S.coordBadge}>📍 {h.lat}, {h.lng}</div>}
+      <button style={{...S.btnFlat,padding:"5px 10px",fontSize:11}} onClick={()=>onRequestPin?.()}>📌 {h.lat?"Re-pin":"Pin on map"}</button>
+      {h.lat&&<button style={{...S.btnFlat,padding:"5px 10px",fontSize:11,color:"#b44"}} onClick={()=>setH(p=>({...p,lat:null,lng:null}))}>✕ Clear</button>}
+    </div>
+    {!h.lat&&h.address&&<div style={{fontSize:11,color:"#c49a3e"}}>⚠ No coordinates — use 📌 Pin on map or click 📍</div>}
     <div style={S.divLabel}>Check-in</div>
     <div style={S.formRow}><input style={S.inp} type="date" value={h.checkInDate} onChange={e=>s("checkInDate",e.target.value)}/><input style={{...S.inp,maxWidth:130}} type="time" value={h.checkInTime} onChange={e=>s("checkInTime",e.target.value)}/></div>
     <div style={S.divLabel}>Check-out</div>
     <div style={S.formRow}><input style={S.inp} type="date" value={h.checkOutDate} onChange={e=>s("checkOutDate",e.target.value)}/><input style={{...S.inp,maxWidth:130}} type="time" value={h.checkOutTime} onChange={e=>s("checkOutTime",e.target.value)}/></div>
     <textarea style={{...S.inp,minHeight:42}} placeholder="Notes (wifi, host…)" value={h.notes} onChange={e=>s("notes",e.target.value)}/>
-    <div style={S.formActions}><button style={S.btnFill} onClick={()=>onSave(h)}>Save</button><button style={S.btnFlat} onClick={onCancel}>Cancel</button></div>
+    <div style={S.formActions}><button style={{...S.btnFill,opacity:saving?.5:1}} onClick={handleSave} disabled={saving}>{saving?"Geocoding…":"Save"}</button><button style={S.btnFlat} onClick={onCancel}>Cancel</button></div>
   </div>);
 }
 
-function StopForm({initial,onSave,onCancel,coordHint,prevStop,homebase}){
-  const[s,setS]=useState(initial||{name:"",address:"",type:"other",transport:"taxi",travelTime:"",arriveTime:"",departTime:"",notes:"",lat:null,lng:null});
-  const[calcing,setCalcing]=useState(false);const u=(k,v)=>setS(p=>({...p,[k]:v}));
+function StopForm({initial,onSave,onCancel,coordHint,prevStop,homebase,trip,onRequestPin}){
+  const[s,setS]=useState(initial||{name:"",address:"",type:"other",transport:"taxi",travelTime:"",arriveTime:"",departTime:"",notes:"",lat:null,lng:null,fromId:""});
+  const[calcing,setCalcing]=useState(false);
+  const[saving,setSaving]=useState(false);
+  const u=(k,v)=>setS(p=>({...p,[k]:v}));
   useEffect(()=>{if(coordHint?.lat)setS(p=>({...p,lat:coordHint.lat,lng:coordHint.lng}));},[coordHint]);
-  const autoCalc=useCallback(async stop=>{
-    const from=prevStop?.lat?prevStop:homebase?.lat?homebase:null;if(!from||!stop.lat)return;
-    setCalcing(true);const r=await calcTravel(from,stop,stop.transport);setCalcing(false);if(r)setS(p=>({...p,travelTime:r}));
-  },[prevStop,homebase]);
-  useEffect(()=>{if(s.lat&&s.transport)autoCalc(s);},[s.lat,s.lng,s.transport]);
+
+  // Build known locations for "traveling from" dropdown
+  const knownLocs=[];
+  if(homebase?.lat)knownLocs.push({id:"homebase",label:`🏠 ${homebase.name||"Homebase"}`,lat:homebase.lat,lng:homebase.lng});
+  knownLocs.push({id:"airport",label:`✈️ CUN Airport`,lat:CUN.lat,lng:CUN.lng});
+  (trip?.days||[]).forEach((d,di)=>{
+    (d.stops||[]).forEach(st=>{
+      if(st.lat&&st.id!==s.id)knownLocs.push({id:st.id,label:`${sI(st.type)} ${st.name} (Day ${di+1})`,lat:st.lat,lng:st.lng});
+    });
+  });
+
+  // Resolve the "from" location
+  const getFromCoords=(stop)=>{
+    if(stop.fromId){
+      const loc=knownLocs.find(k=>k.id===stop.fromId);
+      if(loc)return{lat:loc.lat,lng:loc.lng};
+    }
+    if(prevStop?.lat)return{lat:prevStop.lat,lng:prevStop.lng};
+    if(homebase?.lat)return{lat:homebase.lat,lng:homebase.lng};
+    return null;
+  };
+
+  // Calculate travel time
+  const doCalc=async(stop)=>{
+    const from=getFromCoords(stop);
+    if(!from||!stop.lat){console.log("[Travel] Missing from or to coords");return;}
+    console.log("[Travel] Calculating:",stop.transport,"from",from,"to",{lat:stop.lat,lng:stop.lng});
+    setCalcing(true);
+    const r=await calcTravel(from,stop,stop.transport);
+    setCalcing(false);
+    if(r)setS(p=>({...p,travelTime:r}));
+  };
+
+  // Auto-calc when lat, transport, or fromId changes
+  useEffect(()=>{
+    if(s.lat&&s.transport)doCalc(s);
+  },[s.lat,s.lng,s.transport,s.fromId]);
+
+  const handleSave=async()=>{
+    let final={...s,id:s.id||uid()};
+    if(final.address&&!final.lat){
+      setSaving(true);
+      const geo=await geocode(final.address);
+      if(geo){final.lat=geo.lat;final.lng=geo.lng;}
+      setSaving(false);
+    }
+    onSave(final);
+  };
+
   return(<div style={S.formCard}>
     <input style={S.inp} placeholder="Stop name" value={s.name} onChange={e=>u("name",e.target.value)}/>
-    <AddrInput value={s.address||""} onChange={v=>u("address",v)} onGeocode={c=>setS(p=>({...p,lat:c.lat,lng:c.lng}))} placeholder="Address (auto-geocodes + calc travel)"/>
-    {s.lat&&<div style={S.coordBadge}>📍 {s.lat}, {s.lng}</div>}
+    <AddrInput value={s.address||""} onChange={v=>u("address",v)} onGeocode={c=>setS(p=>({...p,lat:c.lat,lng:c.lng}))} placeholder="Address (auto-geocodes)"/>
+    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+      {s.lat&&<div style={S.coordBadge}>📍 {s.lat}, {s.lng}</div>}
+      <button style={{...S.btnFlat,padding:"5px 10px",fontSize:11}} onClick={()=>onRequestPin?.()}>📌 {s.lat?"Re-pin":"Pin on map"}</button>
+      {s.lat&&<button style={{...S.btnFlat,padding:"5px 10px",fontSize:11,color:"#b44"}} onClick={()=>setS(p=>({...p,lat:null,lng:null}))}>✕ Clear</button>}
+    </div>
+    {!s.lat&&s.address&&<div style={{fontSize:11,color:"#c49a3e"}}>⚠ No coordinates — use 📌 Pin on map or click 📍</div>}
+    <div style={S.divLabel}>Traveling from</div>
+    <select style={S.inp} value={s.fromId||""} onChange={e=>u("fromId",e.target.value)}>
+      <option value="">Auto (previous stop or homebase)</option>
+      {knownLocs.map(k=><option key={k.id} value={k.id}>{k.label}</option>)}
+    </select>
     <div style={S.formRow}>
       <select style={S.inp} value={s.type} onChange={e=>u("type",e.target.value)}>{TYPES.map(t=><option key={t.v} value={t.v}>{t.icon} {t.l}</option>)}</select>
       <select style={S.inp} value={s.transport} onChange={e=>u("transport",e.target.value)}>{TRANSPORT.map(t=><option key={t.v} value={t.v}>{t.icon} {t.l}</option>)}</select>
     </div>
-    <div style={{position:"relative"}}><input style={S.inp} placeholder="Travel time" value={s.travelTime} onChange={e=>u("travelTime",e.target.value)}/>{calcing&&<div style={S.calcBadge}>calculating…</div>}</div>
+    <div style={{display:"flex",gap:6,alignItems:"center"}}>
+      <div style={{flex:1,position:"relative"}}><input style={S.inp} placeholder="Travel time" value={s.travelTime} onChange={e=>u("travelTime",e.target.value)}/>{calcing&&<div style={S.calcBadge}>calculating…</div>}</div>
+      {s.lat&&<button style={{...S.btnFlat,padding:"6px 10px",fontSize:11}} onClick={()=>doCalc(s)} disabled={calcing}>🔄</button>}
+    </div>
     <div style={S.formRow}><div style={{flex:1}}><div style={S.fieldLabel}>Arrive</div><input style={S.inp} type="time" value={s.arriveTime} onChange={e=>u("arriveTime",e.target.value)}/></div><div style={{flex:1}}><div style={S.fieldLabel}>Depart</div><input style={S.inp} type="time" value={s.departTime} onChange={e=>u("departTime",e.target.value)}/></div></div>
     <textarea style={{...S.inp,minHeight:38}} placeholder="Notes" value={s.notes} onChange={e=>u("notes",e.target.value)}/>
-    <div style={S.formActions}><button style={S.btnFill} onClick={()=>onSave({...s,id:s.id||uid()})}>Save</button><button style={S.btnFlat} onClick={onCancel}>Cancel</button></div>
+    <div style={S.formActions}><button style={{...S.btnFill,opacity:saving?.5:1}} onClick={handleSave} disabled={saving}>{saving?"Geocoding…":"Save"}</button><button style={S.btnFlat} onClick={onCancel}>Cancel</button></div>
   </div>);
 }
 
@@ -228,11 +495,14 @@ function DragStops({stops,color,onReorder,onEdit,onDelete}){
           <div style={S.tags}>
             {s.transport&&<span style={S.tag}>{tI(s.transport)} {tL(s.transport)}</span>}
             {s.travelTime&&<span style={{...S.tag,background:"#edf8f6",color:"#2a8f82"}}>⏱ {s.travelTime}</span>}
+            {s.fromId&&<span style={{...S.tag,background:"#f0edfa",color:"#5b6abf"}}>from: {s.fromId==="homebase"?"🏠":s.fromId==="airport"?"✈️":""}{s.fromId==="homebase"?"Homebase":s.fromId==="airport"?"Airport":s.fromId.slice(0,8)}</span>}
             {s.arriveTime&&<span style={S.tag}>{fmt(s.arriveTime)}</span>}
             {s.arriveTime&&s.departTime&&<span style={{color:"#ccc",fontSize:11}}>→</span>}
             {s.departTime&&<span style={S.tag}>{fmt(s.departTime)}</span>}
           </div>
           {s.address&&<div style={S.stopAddr}>{s.address}</div>}
+          {s.lat&&<div style={{fontSize:10,color:"#2a8f82",marginTop:2}}>📍 {s.lat}, {s.lng}</div>}
+          {s.address&&!s.lat&&<div style={{fontSize:10,color:"#c45d3e",marginTop:2}}>⚠ No map pin — edit and re-geocode</div>}
           {s.notes&&<div style={S.stopNotes}>{s.notes}</div>}
         </div>
       </div>
@@ -241,16 +511,257 @@ function DragStops({stops,color,onReorder,onEdit,onDelete}){
 }
 
 /* ════════════════════ HOME PAGE ════════════════════ */
+/* ════════════════════ EXPORT MODAL ════════════════════ */
+const ES = {
+  title: "Itinerario para Conductor",
+  day: "Día",
+  pickup: "Recoger",
+  dropoff: "Destino",
+  time: "Hora",
+  from: "Desde",
+  transport: "Transporte",
+  travelTime: "Tiempo de viaje",
+  address: "Dirección",
+  notes: "Notas",
+  noTime: "Hora por confirmar",
+  homebase: "Alojamiento",
+  walk:"Caminando",bike:"Bicicleta",rental:"Auto rentado",taxi:"Taxi",scooter:"Scooter",colectivo:"Colectivo",
+};
+const EN = {
+  title: "Driver Itinerary",
+  day: "Day",
+  pickup: "Pickup",
+  dropoff: "Destination",
+  time: "Time",
+  from: "From",
+  transport: "Transport",
+  travelTime: "Travel time",
+  address: "Address",
+  notes: "Notes",
+  noTime: "Time TBD",
+  homebase: "Homebase",
+  walk:"Walk",bike:"Bike",rental:"Rental Car",taxi:"Taxi",scooter:"Scooter",colectivo:"Colectivo",
+};
+
+function ExportModal({trip,onClose}){
+  const[lang,setLang]=useState("en");
+  const[selected,setSelected]=useState(()=>{
+    // Default: all days selected, all stops selected
+    const sel={};
+    (trip.days||[]).forEach((d,di)=>{
+      sel[`day-${di}`]=true;
+      (d.stops||[]).forEach((s,si)=>{sel[`stop-${di}-${si}`]=true;});
+    });
+    return sel;
+  });
+
+  const t=lang==="es"?ES:EN;
+  const tTransport=v=>t[v]||v;
+
+  const toggleDay=(di)=>{
+    const key=`day-${di}`;
+    const on=!selected[key];
+    const next={...selected,[key]:on};
+    // Toggle all stops in this day
+    (trip.days[di]?.stops||[]).forEach((_,si)=>{next[`stop-${di}-${si}`]=on;});
+    setSelected(next);
+  };
+
+  const toggleStop=(di,si)=>{
+    const key=`stop-${di}-${si}`;
+    setSelected(p=>({...p,[key]:!p[key]}));
+  };
+
+  const selectAll=()=>{
+    const sel={};
+    (trip.days||[]).forEach((d,di)=>{
+      sel[`day-${di}`]=true;
+      (d.stops||[]).forEach((_,si)=>{sel[`stop-${di}-${si}`]=true;});
+    });
+    setSelected(sel);
+  };
+
+  const selectNone=()=>setSelected({});
+
+  const generatePDF=()=>{
+    const pdf=new jsPDF({orientation:"portrait",unit:"mm",format:"a4"});
+    const W=210,M=15,CW=W-2*M;
+    let y=M;
+
+    const addText=(text,x,size,style,color)=>{
+      pdf.setFontSize(size);pdf.setFont("helvetica",style||"normal");
+      pdf.setTextColor(...(color||[30,30,30]));
+      pdf.text(text,x,y);
+    };
+
+    const checkPage=(need)=>{if(y+need>280){pdf.addPage();y=M;}};
+
+    // Header
+    addText(t.title,M,20,"bold");
+    y+=8;
+    addText(trip.name||"Trip",M,14,"normal",[100,100,100]);
+    y+=6;
+
+    // Homebase info
+    if(trip.homebase){
+      const hbLabel=t.homebase;
+      addText(`${hbLabel}: ${trip.homebase.name||""}`,M,10,"normal",[80,80,80]);
+      y+=4;
+      if(trip.homebase.address){addText(trip.homebase.address,M,9,"normal",[120,120,120]);y+=4;}
+      y+=2;
+    }
+
+    // Divider
+    pdf.setDrawColor(200,200,200);pdf.line(M,y,W-M,y);y+=6;
+
+    // Days
+    (trip.days||[]).forEach((day,di)=>{
+      if(!selected[`day-${di}`])return;
+
+      checkPage(20);
+
+      // Day header
+      const dateStr=day.date?new Date(day.date+"T12:00:00").toLocaleDateString(lang==="es"?"es-MX":"en-US",{weekday:"long",month:"long",day:"numeric"}):"";
+      const hex=COLORS[di%COLORS.length];const rgb=[parseInt(hex.slice(1,3),16),parseInt(hex.slice(3,5),16),parseInt(hex.slice(5,7),16)];
+      addText(`${t.day} ${di+1}: ${day.title}`,M,14,"bold",rgb);
+      y+=5;
+      if(dateStr){addText(dateStr,M,10,"normal",[100,100,100]);y+=5;}
+      y+=2;
+
+      // Stops
+      const stops=day.stops||[];
+      let stopNum=0;
+      stops.forEach((stop,si)=>{
+        if(!selected[`stop-${di}-${si}`])return;
+        stopNum++;
+
+        checkPage(28);
+
+        // Stop number + name
+        pdf.setFillColor(240,238,233);
+        pdf.roundedRect(M,y-3,CW,24,2,2,"F");
+
+        addText(`${stopNum}. ${stop.name||"Unnamed"}`,M+3,12,"bold");
+        y+=5;
+
+        // Time
+        const timeStr=stop.arriveTime?fmt(stop.arriveTime):t.noTime;
+        addText(`${t.time}: ${timeStr}${stop.departTime?` - ${fmt(stop.departTime)}`:""}`,M+3,10,"normal");
+        y+=4;
+
+        // From + transport
+        const fromLabel=stop.fromId==="homebase"?`${trip.homebase?.name||t.homebase}`:stop.fromId==="airport"?"CUN Airport":si>0?stops[si-1]?.name||"":trip.homebase?.name||t.homebase;
+        addText(`${t.from}: ${fromLabel}  ·  ${t.transport}: ${tTransport(stop.transport||"taxi")}`,M+3,9,"normal",[80,80,80]);
+        y+=4;
+
+        // Travel time
+        if(stop.travelTime){addText(`${t.travelTime}: ${stop.travelTime}`,M+3,9,"normal",[80,80,80]);y+=4;}
+
+        // Address
+        if(stop.address){addText(`${t.address}: ${stop.address}`,M+3,9,"normal",[100,100,100]);y+=4;}
+
+        // Notes
+        if(stop.notes){
+          const noteLines=pdf.splitTextToSize(`${t.notes}: ${stop.notes}`,CW-6);
+          checkPage(noteLines.length*4+4);
+          pdf.setFontSize(9);pdf.setFont("helvetica","italic");pdf.setTextColor(120,120,120);
+          pdf.text(noteLines,M+3,y);
+          y+=noteLines.length*4;
+        }
+
+        y+=6;
+      });
+
+      // Day divider
+      checkPage(6);
+      pdf.setDrawColor(220,220,220);pdf.line(M,y,W-M,y);y+=6;
+    });
+
+    // Footer
+    checkPage(10);
+    pdf.setFontSize(8);pdf.setFont("helvetica","normal");pdf.setTextColor(180,180,180);
+    pdf.text(lang==="es"?"Generado por Tulum Trip Planner":"Generated by Tulum Trip Planner",M,y);
+
+    pdf.save(`${trip.name||"trip"}-driver-itinerary.pdf`);
+  };
+
+  return(
+    <div style={S.overlay} onClick={onClose}>
+      <div style={S.exportModal} onClick={e=>e.stopPropagation()}>
+        <div style={{display:"flex",justifyContent:"space-between",alignItems:"center",marginBottom:16}}>
+          <h2 style={{margin:0,fontSize:18,fontWeight:700}}>📄 Export Driver Itinerary</h2>
+          <button style={S.xBtn} onClick={onClose}>✕</button>
+        </div>
+
+        {/* Language toggle */}
+        <div style={{display:"flex",gap:4,marginBottom:16}}>
+          <button onClick={()=>setLang("en")} style={{...S.fBtn,...(lang==="en"?S.fBtnA:{})}}>🇺🇸 English</button>
+          <button onClick={()=>setLang("es")} style={{...S.fBtn,...(lang==="es"?S.fBtnA:{})}}>🇲🇽 Español</button>
+        </div>
+
+        {/* Select all / none */}
+        <div style={{display:"flex",gap:8,marginBottom:12}}>
+          <button style={{...S.btnFlat,fontSize:11,padding:"4px 10px"}} onClick={selectAll}>Select all</button>
+          <button style={{...S.btnFlat,fontSize:11,padding:"4px 10px"}} onClick={selectNone}>Select none</button>
+        </div>
+
+        {/* Day/stop selection */}
+        <div style={{maxHeight:400,overflowY:"auto",marginBottom:16}}>
+          {(trip.days||[]).map((day,di)=>(
+            <div key={day.id||di} style={{marginBottom:8}}>
+              <label style={S.exportDayLabel}>
+                <input type="checkbox" checked={!!selected[`day-${di}`]} onChange={()=>toggleDay(di)} style={{marginRight:8}}/>
+                <span style={{...S.exportDayDot,background:COLORS[di%COLORS.length]}}>{di+1}</span>
+                <b>{day.title}</b>
+                {day.date&&<span style={{color:"#aaa",marginLeft:6,fontWeight:400,fontSize:12}}>{fmtD(day.date)}</span>}
+              </label>
+              {selected[`day-${di}`]&&(day.stops||[]).map((stop,si)=>(
+                <label key={stop.id||si} style={S.exportStopLabel}>
+                  <input type="checkbox" checked={!!selected[`stop-${di}-${si}`]} onChange={()=>toggleStop(di,si)} style={{marginRight:8}}/>
+                  <span>{sI(stop.type)} {stop.name||"Unnamed"}</span>
+                  <span style={{color:"#aaa",fontSize:11,marginLeft:"auto"}}>{tI(stop.transport)} {stop.arriveTime?fmt(stop.arriveTime):""}</span>
+                </label>
+              ))}
+            </div>
+          ))}
+        </div>
+
+        {/* Preview count */}
+        <div style={{fontSize:12,color:"#888",marginBottom:12}}>
+          {(trip.days||[]).filter((_,di)=>selected[`day-${di}`]).length} days,{" "}
+          {(trip.days||[]).reduce((a,d,di)=>a+(selected[`day-${di}`]?(d.stops||[]).filter((_,si)=>selected[`stop-${di}-${si}`]).length:0),0)} stops selected
+          {lang==="es"&&" · Will be exported in Spanish"}
+        </div>
+
+        <button style={{...S.btnFill,width:"100%",padding:"12px",fontSize:14}} onClick={generatePDF}>
+          📄 {lang==="es"?"Generar PDF":"Generate PDF"}
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function HomePage(){
   const[myTrips,setMyTrips]=useState([]);
+  const[loading,setLoading]=useState(true);
   const[creating,setCreating]=useState(false);
   const[newName,setNewName]=useState("Tulum Trip");
-
-  useEffect(()=>{
-    try{const ids=JSON.parse(localStorage.getItem("my-tulum-trips")||"[]");setMyTrips(ids);}catch{setMyTrips([]);}
-  },[]);
-
   const[createErr,setCreateErr]=useState("");
+
+  // Load ALL trips from Firestore (real-time)
+  useEffect(()=>{
+    const q=query(collection(db,"trips"),orderBy("createdAt","desc"));
+    const unsub=onSnapshot(q,snap=>{
+      const trips=snap.docs.map(d=>({id:d.id,name:d.data().name||"Untitled",days:(d.data().days||[]).length,createdAt:d.data().createdAt}));
+      console.log("[Firebase] Loaded",trips.length,"trips");
+      setMyTrips(trips);
+      setLoading(false);
+    },err=>{
+      console.error("[Firebase] Error loading trips:",err);
+      setLoading(false);
+    });
+    return unsub;
+  },[]);
 
   const createTrip=async()=>{
     setCreating(true);setCreateErr("");
@@ -258,20 +769,18 @@ function HomePage(){
       console.log("[Firebase] Creating trip...");
       const ref=await addDoc(collection(db,"trips"),{...BLANK_TRIP(newName),createdAt:Date.now()});
       console.log("[Firebase] Trip created:", ref.id);
-      const ids=[...myTrips,{id:ref.id,name:newName}];
-      localStorage.setItem("my-tulum-trips",JSON.stringify(ids));
       window.location.hash=`#/trip/${ref.id}`;
     }catch(e){
       console.error("[Firebase] Create error:",e);
-      setCreateErr(`Failed: ${e.message}. Make sure Firestore rules allow writes (see README).`);
+      setCreateErr(`Failed: ${e.message}. Make sure Firestore rules allow writes.`);
     }
     setCreating(false);
   };
 
-  const removeFromList=id=>{
-    const ids=myTrips.filter(t=>t.id!==id);
-    setMyTrips(ids);
-    localStorage.setItem("my-tulum-trips",JSON.stringify(ids));
+  const deleteTrip=async(e,id)=>{
+    e.preventDefault();e.stopPropagation();
+    if(!confirm("Delete this trip permanently?"))return;
+    try{await deleteDoc(doc(db,"trips",id));console.log("[Firebase] Deleted trip:",id);}catch(err){console.error("Delete error:",err);}
   };
 
   return(
@@ -288,17 +797,19 @@ function HomePage(){
           <button style={{...S.btnFill,fontSize:15,padding:"12px 24px"}} onClick={createTrip} disabled={creating}>{creating?"Creating…":"Create Trip"}</button>
         </div>
         {createErr&&<div style={{...S.errBox,marginBottom:16}}>{createErr}</div>}
-        {myTrips.length>0&&<div style={S.homeLabel}>Your Trips</div>}
+        {loading&&<div style={{textAlign:"center",padding:20,color:"#aaa"}}>Loading trips…</div>}
+        {!loading&&myTrips.length>0&&<div style={S.homeLabel}>All Trips</div>}
         {myTrips.map(t=>(
           <a key={t.id} href={`#/trip/${t.id}`} style={S.homeTripCard}>
             <span style={{fontSize:20}}>🌴</span>
             <div style={{flex:1}}>
               <div style={{fontWeight:600,fontSize:14}}>{t.name}</div>
-              <div style={{fontSize:11,color:"#aaa",marginTop:2}}>Click to open · Share this link with friends</div>
+              <div style={{fontSize:11,color:"#aaa",marginTop:2}}>{t.days} day{t.days!==1&&"s"} · Click to open</div>
             </div>
-            <button style={{...S.xBtn,fontSize:16}} onClick={e=>{e.preventDefault();e.stopPropagation();removeFromList(t.id);}}>×</button>
+            <button style={{...S.xBtn,fontSize:16}} onClick={e=>deleteTrip(e,t.id)}>×</button>
           </a>
         ))}
+        {!loading&&myTrips.length===0&&<div style={{textAlign:"center",padding:20,color:"#aaa"}}>No trips yet — create one above</div>}
         <div style={S.homeHint}>
           <b>How sharing works:</b> Create a trip, copy the URL from your browser bar, and send it to anyone.
           They'll see the same trip and can edit it too — changes sync in real time.
@@ -324,8 +835,23 @@ function TripPage({tripId}){
   const[editDayF,setEditDayF]=useState({title:"",date:""});
   const[coordHint,setCoordHint]=useState(null);
   const[copied,setCopied]=useState(false);
+  const[showLines,setShowLines]=useState(true);
+  const[pinMode,setPinMode]=useState(false);
+  const[showExport,setShowExport]=useState(false);
   const dayRefs=useRef({});
   const skipSync=useRef(false);
+  const[sideW,setSideW]=useState(200);
+  const dragging=useRef(false);
+
+  // Sidebar resize
+  useEffect(()=>{
+    const onMove=e=>{if(!dragging.current)return;const w=Math.max(140,Math.min(400,e.clientX));setSideW(w);};
+    const onUp=()=>{dragging.current=false;document.body.style.cursor="";document.body.style.userSelect="";};
+    window.addEventListener("mousemove",onMove);
+    window.addEventListener("mouseup",onUp);
+    return()=>{window.removeEventListener("mousemove",onMove);window.removeEventListener("mouseup",onUp);};
+  },[]);
+  const startResize=()=>{dragging.current=true;document.body.style.cursor="col-resize";document.body.style.userSelect="none";};
 
   // Real-time listener
   useEffect(()=>{
@@ -338,13 +864,6 @@ function TripPage({tripId}){
           if(skipSync.current){skipSync.current=false;return;}
           setTrip(snap.data());
           setSyncErr("");
-          try{
-            const ids=JSON.parse(localStorage.getItem("my-tulum-trips")||"[]");
-            if(!ids.find(t=>t.id===tripId)){
-              ids.push({id:tripId,name:snap.data().name||"Trip"});
-              localStorage.setItem("my-tulum-trips",JSON.stringify(ids));
-            }
-          }catch{}
         } else {
           setTrip(null);
         }
@@ -363,6 +882,9 @@ function TripPage({tripId}){
   const save=useCallback(async(newTrip)=>{
     setTrip(newTrip);
     skipSync.current=true;
+    // Log what we're saving
+    console.log("[Firebase] Saving trip. Homebase lat:", newTrip.homebase?.lat);
+    (newTrip.days||[]).forEach((d,di)=>(d.stops||[]).forEach((s,si)=>console.log(`[Firebase] Day${di} Stop${si}: "${s.name}" lat=${s.lat} lng=${s.lng}`)));
     try{
       await setDoc(doc(db,"trips",tripId),newTrip);
       console.log("[Firebase] Saved successfully");
@@ -376,11 +898,13 @@ function TripPage({tripId}){
 
   const up=fn=>{
     const c=JSON.parse(JSON.stringify(trip));fn(c);save(c);
-    // update local list name
-    try{const ids=JSON.parse(localStorage.getItem("my-tulum-trips")||"[]");const found=ids.find(t=>t.id===tripId);if(found&&c.name!==found.name){found.name=c.name;localStorage.setItem("my-tulum-trips",JSON.stringify(ids));}}catch{}
   };
 
-  const onMapClick=useCallback(ll=>setCoordHint(ll),[]);
+  const onMapClick=useCallback(ll=>{
+    setCoordHint(ll);
+    if(pinMode)setPinMode(false);
+  },[pinMode]);
+  const requestPin=()=>{setView("map");setPinMode(true);};
 
   if(loading)return<div style={S.loadingPage}><style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');*{box-sizing:border-box;margin:0}`}</style><div style={{fontSize:36}}>🌴</div><div style={{marginTop:12,fontWeight:600}}>Loading trip…</div></div>;
   if(!trip)return<div style={S.loadingPage}><style>{`@import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');*{box-sizing:border-box;margin:0}`}</style><div style={{fontSize:36}}>😕</div><div style={{marginTop:12,fontWeight:600}}>Trip not found</div><a href="#/" style={{marginTop:8,color:"#2a8f82"}}>← Back home</a></div>;
@@ -407,7 +931,6 @@ function TripPage({tripId}){
         @import url('https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&display=swap');
         *{box-sizing:border-box;margin:0}::-webkit-scrollbar{width:5px}::-webkit-scrollbar-thumb{background:#d4d0ca;border-radius:3px}
         input,select,textarea,button{font-family:inherit}input:focus,select:focus,textarea:focus{outline:none;border-color:#1a1a1a!important}
-        .leaflet-container{font-family:inherit!important}
       `}</style>
       <header style={S.topBar}>
         <div style={S.topLeft}>
@@ -417,6 +940,7 @@ function TripPage({tripId}){
         </div>
         <div style={{display:"flex",alignItems:"center",gap:8}}>
           <button style={{...S.btnFlat,fontSize:11,padding:"5px 12px"}} onClick={copyLink}>{copied?"✓ Copied!":"📋 Copy link"}</button>
+          <button style={{...S.btnFlat,fontSize:11,padding:"5px 12px"}} onClick={()=>setShowExport(true)}>📄 Export</button>
           <div style={syncErr?S.errBadge:S.liveBadge}>{syncErr?"● Error":"● Live"}</div>
           <div style={S.tabRow}>
             {["plan","map"].map(v=>(<button key={v} onClick={()=>setView(v)} style={{...S.tab,...(view===v?S.tabActive:{})}}>{v==="plan"?"Itinerary":"Map"}</button>))}
@@ -424,9 +948,10 @@ function TripPage({tripId}){
         </div>
       </header>
       {syncErr&&<div style={S.syncErrBar}>{syncErr}</div>}
+      {showExport&&<ExportModal trip={trip} onClose={()=>setShowExport(false)}/>}
       <div style={S.body}>
-        {/* SIDEBAR */}
-        <aside style={S.side}>
+        {/* RESIZABLE SIDEBAR */}
+        <aside style={{...S.side,width:sideW}}>
           <div style={S.ss}><div style={S.sl}>Flights</div>
             {(trip.arrivalFlights||[]).map((f,i)=>(<div key={f.id||i} style={S.sf}><span>🛬</span><span style={S.sft}>{f.airline} {f.flight}</span><button style={S.xBtn} onClick={()=>delFlight("arrival",i)}>×</button></div>))}
             {(trip.departureFlights||[]).map((f,i)=>(<div key={f.id||i} style={S.sf}><span>🛫</span><span style={S.sft}>{f.airline} {f.flight}</span><button style={S.xBtn} onClick={()=>delFlight("departure",i)}>×</button></div>))}
@@ -440,8 +965,20 @@ function TripPage({tripId}){
             <button style={S.sideAdd} onClick={addDay}>+ Add day</button>
           </div>
         </aside>
+        {/* DRAG HANDLE */}
+        <div style={S.dragHandle} onMouseDown={startResize}><div style={S.dragLine}/></div>
         <main style={S.main}>
-          {view==="map"&&(<div style={{flex:1,position:"relative"}}><LeafletMap trip={trip} activeDay={activeDay} onClickLatLng={onMapClick}/><div style={S.mapFilter}><button onClick={()=>setActiveDay(null)} style={{...S.fBtn,...(activeDay===null?S.fBtnA:{})}}>All</button>{(trip.days||[]).map((d,i)=>(<button key={d.id||i} onClick={()=>setActiveDay(activeDay===i?null:i)} style={{...S.fBtn,...(activeDay===i?{...S.fBtnA,background:COLORS[i%COLORS.length]}:{})}}>{d.title}</button>))}</div></div>)}
+          {/* MAP — always mounted, toggled via display */}
+          <div style={{flex:1,position:"relative",display:view==="map"?"flex":"none",flexDirection:"column"}}>
+            <GMap trip={trip} activeDay={activeDay} onClickLatLng={onMapClick} visible={view==="map"} showLines={showLines} pinMode={pinMode}/>
+            {pinMode&&<div style={S.pinBanner}>📌 Click anywhere on the map to place your pin</div>}
+            <div style={S.mapFilter}>
+              <button onClick={()=>setActiveDay(null)} style={{...S.fBtn,...(activeDay===null?S.fBtnA:{})}}>All</button>
+              {(trip.days||[]).map((d,i)=>(<button key={d.id||i} onClick={()=>setActiveDay(activeDay===i?null:i)} style={{...S.fBtn,...(activeDay===i?{...S.fBtnA,background:COLORS[i%COLORS.length]}:{})}}>{d.title}</button>))}
+              <button onClick={()=>setShowLines(!showLines)} style={{...S.fBtn,...(showLines?{background:"#1a1a1a",color:"#fff"}:{})}}>{showLines?"↗ Lines On":"↗ Lines Off"}</button>
+            </div>
+          </div>
+          {/* PLAN */}
           {view==="plan"&&(
             <div style={S.planScroll}>
               <section style={S.ps}><div style={S.pl}>✈ Arrival</div>
@@ -451,7 +988,7 @@ function TripPage({tripId}){
               </section>
               {(trip.homebase||showHome)&&(<section style={S.ps}><div style={S.pl}>🏠 Homebase</div>
                 {trip.homebase&&!showHome&&(<div style={S.hc}><div style={{flex:1}}><div style={S.hn}>{trip.homebase.name}</div>{trip.homebase.address&&<div style={S.hsub}>{trip.homebase.address}</div>}<div style={S.hm}>{trip.homebase.checkInDate&&<>In: {fmtD(trip.homebase.checkInDate)}{trip.homebase.checkInTime&&` ${fmt(trip.homebase.checkInTime)}`}</>}{trip.homebase.checkOutDate&&<> · Out: {fmtD(trip.homebase.checkOutDate)}{trip.homebase.checkOutTime&&` ${fmt(trip.homebase.checkOutTime)}`}</>}</div>{trip.homebase.lat&&<div style={S.coordBadge}>📍 {trip.homebase.lat}, {trip.homebase.lng}</div>}{trip.homebase.notes&&<div style={S.hnt}>{trip.homebase.notes}</div>}</div><button style={S.xBtn} onClick={()=>setShowHome(true)}>✎</button></div>)}
-                {showHome&&<HomebaseForm initial={trip.homebase} coordHint={coordHint} onSave={h=>{up(t=>t.homebase=h);setShowHome(false);setCoordHint(null);}} onCancel={()=>{setShowHome(false);setCoordHint(null);}}/>}
+                {showHome&&<HomebaseForm initial={trip.homebase} coordHint={coordHint} onRequestPin={requestPin} onSave={h=>{up(t=>t.homebase=h);setShowHome(false);setCoordHint(null);}} onCancel={()=>{setShowHome(false);setCoordHint(null);}}/>}
               </section>)}
               {!trip.homebase&&!showHome&&<section style={S.ps}><button style={S.addBtn} onClick={()=>setShowHome(true)}>+ Set homebase / Airbnb</button></section>}
               {(trip.days||[]).length===0&&<div style={S.empty}><div style={{fontSize:36,marginBottom:8}}>🗓</div><div style={{fontWeight:600}}>No days yet</div><div style={{color:"#aaa",fontSize:12,marginTop:4}}>Add a day to start</div></div>}
@@ -464,8 +1001,8 @@ function TripPage({tripId}){
                     <><div style={{flex:1}}><div style={S.dayTitle}>{day.title}</div><div style={S.dayMeta}>{day.date?new Date(day.date+"T12:00:00").toLocaleDateString("en-US",{weekday:"long",month:"short",day:"numeric"}):"No date"} · {stops.length} stop{stops.length!==1&&"s"}</div></div><button style={S.btnFlat} onClick={()=>{setEditDayI(di);setEditDayF({title:day.title,date:day.date});}}>Edit</button><button style={{...S.btnFlat,color:"#b44"}} onClick={()=>delDay(di)}>Delete</button></>)}
                   </div>
                   <DragStops stops={stops} color={color} onReorder={a=>reorder(di,a)} onEdit={si=>{setEditStop({di,si});setAddStopDay(null);}} onDelete={si=>delStop(di,si)}/>
-                  {editStop?.di===di&&<div style={{padding:"0 16px 16px"}}><StopForm initial={stops[editStop.si]} coordHint={coordHint} onSave={s=>saveStopFn(di,s)} onCancel={()=>{setEditStop(null);setCoordHint(null);}} prevStop={getPrev(editStop.si)} homebase={trip.homebase}/></div>}
-                  {addStopDay===di&&editStop?.di!==di&&<div style={{padding:"0 16px 16px"}}><StopForm coordHint={coordHint} onSave={s=>saveStopFn(di,s)} onCancel={()=>{setAddStopDay(null);setCoordHint(null);}} prevStop={stops[stops.length-1]||null} homebase={trip.homebase}/></div>}
+                  {editStop?.di===di&&<div style={{padding:"0 16px 16px"}}><StopForm initial={stops[editStop.si]} coordHint={coordHint} onSave={s=>saveStopFn(di,s)} onCancel={()=>{setEditStop(null);setCoordHint(null);}} prevStop={getPrev(editStop.si)} homebase={trip.homebase} trip={trip} onRequestPin={requestPin}/></div>}
+                  {addStopDay===di&&editStop?.di!==di&&<div style={{padding:"0 16px 16px"}}><StopForm coordHint={coordHint} onSave={s=>saveStopFn(di,s)} onCancel={()=>{setAddStopDay(null);setCoordHint(null);}} prevStop={stops[stops.length-1]||null} homebase={trip.homebase} trip={trip} onRequestPin={requestPin}/></div>}
                   {addStopDay!==di&&editStop?.di!==di&&<button style={S.addStopBtn} onClick={()=>{setAddStopDay(di);setEditStop(null);}}>+ Add stop</button>}
                 </section>);
               })}
@@ -514,11 +1051,19 @@ const S={
   liveBadge:{fontSize:10,color:"#3a9e5c",fontWeight:600,background:"#edfbf0",padding:"3px 8px",borderRadius:10},
   errBadge:{fontSize:10,color:"#c45d3e",fontWeight:600,background:"#fef0ec",padding:"3px 8px",borderRadius:10},
   syncErrBar:{background:"#fef0ec",color:"#c45d3e",padding:"8px 20px",fontSize:12,fontWeight:500,borderBottom:"1px solid #f5d5cc"},
+  pinBanner:{position:"absolute",top:12,left:"50%",transform:"translateX(-50%)",background:"#1a1a1a",color:"#fff",padding:"8px 20px",borderRadius:20,fontSize:12,fontWeight:600,zIndex:1001,boxShadow:"0 2px 10px rgba(0,0,0,.2)",whiteSpace:"nowrap"},
+  overlay:{position:"fixed",inset:0,background:"rgba(0,0,0,.4)",display:"flex",alignItems:"center",justifyContent:"center",zIndex:2000},
+  exportModal:{background:"#fff",borderRadius:14,padding:"24px",maxWidth:520,width:"90%",maxHeight:"85vh",overflow:"auto",boxShadow:"0 12px 40px rgba(0,0,0,.15)"},
+  exportDayLabel:{display:"flex",alignItems:"center",gap:6,padding:"8px 0",fontSize:13,cursor:"pointer",borderBottom:"1px solid #f5f3ee"},
+  exportDayDot:{width:20,height:20,borderRadius:"50%",color:"#fff",display:"inline-flex",alignItems:"center",justifyContent:"center",fontSize:10,fontWeight:700,flexShrink:0},
+  exportStopLabel:{display:"flex",alignItems:"center",gap:6,padding:"6px 0 6px 32px",fontSize:12,cursor:"pointer",color:"#444"},
   tabRow:{display:"flex",gap:2,background:"#f2f1ed",borderRadius:8,padding:3},
   tab:{padding:"5px 16px",border:"none",borderRadius:6,background:"transparent",fontSize:12,fontWeight:600,cursor:"pointer",color:"#888",fontFamily:"inherit"},
   tabActive:{background:"#fff",color:"#1a1a1a",boxShadow:"0 1px 3px rgba(0,0,0,.06)"},
   body:{display:"flex",flex:1,overflow:"hidden"},
-  side:{width:200,borderRight:"1px solid #e8e6e1",background:"#fff",overflowY:"auto",padding:"8px 0",flexShrink:0},
+  side:{borderRight:"none",background:"#fff",overflowY:"auto",padding:"8px 0",flexShrink:0},
+  dragHandle:{width:6,cursor:"col-resize",background:"transparent",display:"flex",alignItems:"center",justifyContent:"center",flexShrink:0,borderRight:"1px solid #e8e6e1",transition:"background .15s",position:"relative",zIndex:10},
+  dragLine:{width:2,height:32,borderRadius:1,background:"#d4d0ca",transition:"background .15s"},
   ss:{padding:"8px 12px 10px",borderBottom:"1px solid #f0efeb"},
   sl:{fontSize:10,fontWeight:700,textTransform:"uppercase",letterSpacing:".8px",color:"#bbb",marginBottom:6},
   sf:{display:"flex",alignItems:"center",gap:5,padding:"3px 0",fontSize:12},
